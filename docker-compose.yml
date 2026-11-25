@@ -1,0 +1,9 @@
+services:
+  redis:
+    image: redis:7.2-alpine
+    container_name: estate-redis
+    ports:
+      - "6379:6379"
+    # Nhiều tiêu chí lọc => số tổ hợp key lớn (high key cardinality).
+    # Giới hạn RAM và tự đẩy key ít dùng nhất thay vì OOM.
+    command: ["redis-server", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]

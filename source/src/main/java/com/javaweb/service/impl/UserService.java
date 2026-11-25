@@ -1,0 +1,276 @@
+package com.javaweb.service.impl;
+
+import com.javaweb.config.RedisConfig;
+import com.javaweb.constant.SystemConstant;
+import com.javaweb.converter.UserConverter;
+import com.javaweb.entity.*;
+import com.javaweb.exception.MyException;
+import com.javaweb.exception.ServiceException;
+import com.javaweb.model.event.ActivityEvent;
+import org.springframework.context.ApplicationEventPublisher;
+import com.javaweb.model.dto.AssignmentBuildingDTO;
+import com.javaweb.model.dto.AssignmentCustomerDTO;
+import com.javaweb.model.dto.PasswordDTO;
+import com.javaweb.model.dto.UserDTO;
+import com.javaweb.repository.*;
+import com.javaweb.security.utils.SecurityUtils;
+import com.javaweb.service.IUserService;
+import org.apache.commons.lang.StringUtils;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+@Service
+public class UserService implements IUserService {
+    @Autowired
+    private UserRepository userRepository;
+
+    @Autowired
+    private RoleRepository roleRepository;
+
+    @Autowired
+    private PasswordEncoder passwordEncoder;
+
+    @Autowired
+    private UserConverter userConverter;
+    @Autowired
+    private BuildingRepository buildingRepository;
+    @Autowired
+    private CustomerRepository customerRepository;
+    @Autowired
+    private AssignmentBuildingRepository assignmentBuildingRepository;
+    @Autowired
+    private ApplicationEventPublisher eventPublisher;
+
+    @Override
+    public UserDTO findOneByUserNameAndStatus(String name, int status) {
+        return userConverter.convertToDto(userRepository.findOneByUserNameAndStatus(name, status));
+    }
+
+    @Override
+    public List<UserDTO> getUsers(String searchValue, Pageable pageable) {
+        Page<UserEntity> users;
+        if (StringUtils.isNotBlank(searchValue)) {
+            users = userRepository.findByUserNameContainingIgnoreCaseOrFullNameContainingIgnoreCaseAndStatusNot(searchValue, searchValue, 0, pageable);
+        } else {
+            users = userRepository.findByStatusNot(0, pageable);
+        }
+        List<UserEntity> newsEntities = users.getContent();
+        List<UserDTO> result = new ArrayList<>();
+        for (UserEntity userEntity : newsEntities) {
+            UserDTO userDTO = userConverter.convertToDto(userEntity);
+            userDTO.setRoleCode(userEntity.getRoles().get(0).getCode());
+            result.add(userDTO);
+        }
+        return result;
+    }
+
+    @Override
+    public List<UserDTO> getAllUsers(Pageable pageable) {
+        List<UserEntity> userEntities = userRepository.getAllUsers(pageable);
+        List<UserDTO> results = new ArrayList<>();
+        for (UserEntity userEntity : userEntities) {
+            UserDTO userDTO = userConverter.convertToDto(userEntity);
+            userDTO.setRoleCode(userEntity.getRoles().get(0).getCode());
+            results.add(userDTO);
+        }
+        return results;
+    }
+
+    @Override
+    public int countTotalItems() {
+        return userRepository.countTotalItem();
+    }
+
+    @Override
+    public Map<Long, String> getStaffs() {
+        Map<Long, String> listStaffs = new HashMap<>();
+        List<UserEntity> staffs = userRepository.findByStatusAndRoles_Code(1, "STAFF");
+        for (UserEntity it : staffs) {
+            listStaffs.put(it.getId(), it.getFullName());
+        }
+        return listStaffs;
+    }
+
+    @Override
+    @Transactional
+    @CacheEvict(value = RedisConfig.BUILDINGS_CACHE, allEntries = true)
+    public void updateAssignmentBuilding(AssignmentBuildingDTO assignmentBuildingDTO) {
+        if (SecurityUtils.isStaffOnly()) {
+            throw new AccessDeniedException("Nhân viên không có quyền phân công tòa nhà");
+        }
+        if (assignmentBuildingDTO == null || assignmentBuildingDTO.getBuildingId() == null) {
+            throw new ServiceException("ID tòa nhà cần giao không được để trống");
+        }
+        List<Long> staffIds = assignmentBuildingDTO.getStaffs();
+        if (staffIds != null) {
+            Set<Long> uniqueIds = new HashSet<>(staffIds);
+            if (uniqueIds.size() < staffIds.size()) {
+                throw new ServiceException("Danh sách nhân viên được giao tòa nhà bị trùng lặp");
+            }
+        }
+
+        BuildingEntity building = buildingRepository.findById(assignmentBuildingDTO.getBuildingId())
+                .orElseThrow(() -> new ServiceException("Không tìm thấy tòa nhà với id = " + assignmentBuildingDTO.getBuildingId()));
+
+        List<UserEntity> assignmentStaffs = new ArrayList<>();
+        if (staffIds != null && !staffIds.isEmpty()) {
+            assignmentStaffs = userRepository.findAllById(staffIds);
+            if (assignmentStaffs.size() != staffIds.size()) {
+                throw new ServiceException("Một hoặc nhiều nhân viên được giao không tồn tại");
+            }
+        }
+
+        assignmentBuildingRepository.deleteAssignmentBuildingEntityByBuilding(building);
+        for (UserEntity user : assignmentStaffs) {
+            AssignmentBuildingEntity assignmentBuildingEntity = new AssignmentBuildingEntity();
+            assignmentBuildingEntity.setBuilding(building);
+            assignmentBuildingEntity.setStaffs(user);
+            assignmentBuildingRepository.save(assignmentBuildingEntity);
+        }
+        eventPublisher.publishEvent(new ActivityEvent(ActivityEvent.BUILDING_ASSIGNED,
+                "Giao tòa nhà id=" + building.getId() + " cho nhân viên " + staffIds));
+    }
+
+    @Override
+    @Transactional
+    public void updateAssignmentCustomer(AssignmentCustomerDTO assignmentCustomerDTO) {
+        if (SecurityUtils.isStaffOnly()) {
+            throw new AccessDeniedException("Nhân viên không có quyền phân công khách hàng");
+        }
+        if (assignmentCustomerDTO == null || assignmentCustomerDTO.getCustomerId() == null) {
+            throw new ServiceException("ID khách hàng cần giao không được để trống");
+        }
+        List<Long> staffIds = assignmentCustomerDTO.getStaffs();
+        if (staffIds != null) {
+            Set<Long> uniqueIds = new HashSet<>(staffIds);
+            if (uniqueIds.size() < staffIds.size()) {
+                throw new ServiceException("Danh sách nhân viên được giao khách hàng bị trùng lặp");
+            }
+        }
+
+        CustomerEntity customer = customerRepository.findById(assignmentCustomerDTO.getCustomerId())
+                .orElseThrow(() -> new ServiceException("Không tìm thấy khách hàng với id = " + assignmentCustomerDTO.getCustomerId()));
+
+        List<UserEntity> staffAssignmentCustomer = new ArrayList<>();
+        if (staffIds != null && !staffIds.isEmpty()) {
+            staffAssignmentCustomer = userRepository.findAllById(staffIds);
+            if (staffAssignmentCustomer.size() != staffIds.size()) {
+                throw new ServiceException("Một hoặc nhiều nhân viên được giao không tồn tại");
+            }
+        }
+        customer.setUserEntities(staffAssignmentCustomer);
+        customerRepository.save(customer);
+    }
+
+    @Override
+    public int getTotalItems(String searchValue) {
+        int totalItem;
+        if (StringUtils.isNotBlank(searchValue)) {
+            totalItem = (int) userRepository.countByUserNameContainingIgnoreCaseOrFullNameContainingIgnoreCaseAndStatusNot(searchValue, searchValue, 0);
+        } else {
+            totalItem = (int) userRepository.countByStatusNot(0);
+        }
+        return totalItem;
+    }
+
+    @Override
+    public UserDTO findOneByUserName(String userName) {
+        UserEntity userEntity = userRepository.findOneByUserName(userName);
+        return userConverter.convertToDto(userEntity);
+    }
+
+    @Override
+    public UserDTO findUserById(long id) {
+        UserEntity entity = userRepository.findById(id)
+                .orElseThrow(() -> new ServiceException("Không tìm thấy người dùng với id = " + id));
+        List<RoleEntity> roles = entity.getRoles();
+        UserDTO dto = userConverter.convertToDto(entity);
+        roles.forEach(item -> dto.setRoleCode(item.getCode()));
+        return dto;
+    }
+
+    @Override
+    @Transactional
+    public UserDTO insert(UserDTO newUser) {
+        RoleEntity role = roleRepository.findOneByCode(newUser.getRoleCode());
+        UserEntity userEntity = userConverter.convertToEntity(newUser);
+        userEntity.setRoles(Stream.of(role).collect(Collectors.toList()));
+        userEntity.setStatus(1);
+        userEntity.setPassword(passwordEncoder.encode(SystemConstant.PASSWORD_DEFAULT));
+        return userConverter.convertToDto(userRepository.save(userEntity));
+    }
+
+    @Override
+    @Transactional
+    public UserDTO update(Long id, UserDTO updateUser) {
+        RoleEntity role = roleRepository.findOneByCode(updateUser.getRoleCode());
+        UserEntity oldUser = userRepository.findById(id)
+                .orElseThrow(() -> new ServiceException("Không tìm thấy người dùng với id = " + id));
+        UserEntity userEntity = userConverter.convertToEntity(updateUser);
+        userEntity.setUserName(oldUser.getUserName());
+        userEntity.setStatus(oldUser.getStatus());
+        userEntity.setRoles(Stream.of(role).collect(Collectors.toList()));
+        userEntity.setPassword(oldUser.getPassword());
+        return userConverter.convertToDto(userRepository.save(userEntity));
+    }
+
+    @Override
+    @Transactional
+    public void updatePassword(long id, PasswordDTO passwordDTO) throws MyException {
+        UserEntity user = userRepository.findById(id)
+                .orElseThrow(() -> new ServiceException("Không tìm thấy người dùng với id = " + id));
+        if (passwordEncoder.matches(passwordDTO.getOldPassword(), user.getPassword())
+                && passwordDTO.getNewPassword().equals(passwordDTO.getConfirmPassword())) {
+            user.setPassword(passwordEncoder.encode(passwordDTO.getNewPassword()));
+            userRepository.save(user);
+        } else {
+            throw new MyException(SystemConstant.CHANGE_PASSWORD_FAIL);
+        }
+    }
+
+    @Override
+    @Transactional
+    public UserDTO resetPassword(long id) {
+        UserEntity userEntity = userRepository.findById(id)
+                .orElseThrow(() -> new ServiceException("Không tìm thấy người dùng với id = " + id));
+        userEntity.setPassword(passwordEncoder.encode(SystemConstant.PASSWORD_DEFAULT));
+        return userConverter.convertToDto(userRepository.save(userEntity));
+    }
+
+    @Override
+    @Transactional
+    public UserDTO updateProfileOfUser(String username, UserDTO updateUser) {
+        UserEntity oldUser = userRepository.findOneByUserName(username);
+        if (oldUser == null) {
+            throw new ServiceException("Không tìm thấy người dùng với username = " + username);
+        }
+        oldUser.setFullName(updateUser.getFullName());
+        return userConverter.convertToDto(userRepository.save(oldUser));
+    }
+
+    @Override
+    @Transactional
+    public void delete(long[] ids) {
+        for (Long item : ids) {
+            UserEntity userEntity = userRepository.findById(item)
+                    .orElseThrow(() -> new ServiceException("Không tìm thấy người dùng với id = " + item));
+            userEntity.setStatus(0);
+            userRepository.save(userEntity);
+        }
+    }
+}
