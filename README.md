@@ -53,11 +53,6 @@ mvn clean test
 
 ![JaCoCo](docs/images/jacoco-report.png)
 
-## Kết quả Redis
-
-| Lần tìm kiếm | Nguồn dữ liệu | Thời gian |
-| --- | --- | --- |
-| Lần 1 | MySQL | X ms |
-| Lần 2 (cùng bộ lọc) | Redis | Y ms |
+## Cache Redis
 
 Cache tự xóa khi thêm / sửa / xóa / giao tòa nhà (`@CacheEvict`), TTL 10 phút.
